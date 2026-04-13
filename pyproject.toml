@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plecost-db-tool"
+version = "1.0.0"
+description = "Herramienta de generación de la base de datos CVE para Plecost"
+requires-python = ">=3.11"
+dependencies = [
+    "plecost>=4.0.0",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "pytest-cov>=5",
+]
+
+[project.scripts]
+plecost-db = "plecost_db.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["plecost_db"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
