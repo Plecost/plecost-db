@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## [1.1.0] - 2026-04-14
+
+### Fixed
+- `updater.py`: NVD API enforces a 120-day maximum window per request when date filters are used. `build-db --years 5` was passing a 1825-day range, causing all NVD requests to return HTTP 404 silently. Fixed by paginating in 90-day windows so every request stays under the limit.
+- `incremental.py`: Same 90-day window fix applied to `_fetch_modified` for `lastModStartDate`/`lastModEndDate` parameters.
+
 ## [1.0.0] - 2026-04-13
 
 ### Added

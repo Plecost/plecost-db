@@ -394,35 +394,52 @@ class DatabaseUpdater:
         self, client: httpx.AsyncClient, sf: async_sessionmaker[AsyncSession], plugin_slugs: list[str], theme_slugs: list[str],
         start_date: str | None = None,
     ) -> None:
+        # NVD API enforces a maximum 120-day window per request when date filters
+        # are used. We slice the full range into 90-day windows to stay safely
+        # under that limit, then paginate within each window.
+        NVD_WINDOW_DAYS = 90
+        results_per_page = 2000
+        delay = 6 if not self._api_key else 0.6
+
         if start_date is None:
             start_date = (datetime.now(timezone.utc) - timedelta(days=self._years_back * 365)).strftime("%Y-%m-%dT00:00:00.000")
-        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT23:59:59.999")
-        start_index = 0
-        results_per_page = 2000
 
-        while True:
-            params: dict[str, str | int] = {
-                "keywordSearch": "wordpress",
-                "pubStartDate": start_date,
-                "pubEndDate": end_date,
-                "resultsPerPage": results_per_page,
-                "startIndex": start_index,
-            }
-            try:
-                r = await client.get(NVD_CVE_API, params=params, timeout=60)
-                data = r.json()
-            except Exception:
-                break
+        window_start = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)
+        overall_end = datetime.now(timezone.utc)
 
-            vulns = data.get("vulnerabilities", [])
-            if not vulns:
-                break
+        while window_start < overall_end:
+            window_end = min(window_start + timedelta(days=NVD_WINDOW_DAYS), overall_end)
+            pub_start = window_start.strftime("%Y-%m-%dT00:00:00.000")
+            pub_end = window_end.strftime("%Y-%m-%dT23:59:59.999")
+            start_index = 0
 
-            await process_nvd_batch(vulns, sf, plugin_slugs, theme_slugs)
+            while True:
+                params: dict[str, str | int] = {
+                    "keywordSearch": "wordpress",
+                    "pubStartDate": pub_start,
+                    "pubEndDate": pub_end,
+                    "resultsPerPage": results_per_page,
+                    "startIndex": start_index,
+                }
+                try:
+                    r = await client.get(NVD_CVE_API, params=params, timeout=60)
+                    if r.status_code != 200:
+                        break
+                    data = r.json()
+                except Exception:
+                    break
 
-            total = data.get("totalResults", 0)
-            start_index += len(vulns)
-            if start_index >= total:
-                break
-            # NVD rate limiting: 6 req/30s without API key, 0.6s with key
-            await asyncio.sleep(6 if not self._api_key else 0.6)
+                vulns = data.get("vulnerabilities", [])
+                if not vulns:
+                    break
+
+                await process_nvd_batch(vulns, sf, plugin_slugs, theme_slugs)
+
+                total = data.get("totalResults", 0)
+                start_index += len(vulns)
+                if start_index >= total:
+                    break
+                await asyncio.sleep(delay)
+
+            window_start = window_end + timedelta(days=1)
+            await asyncio.sleep(delay)
