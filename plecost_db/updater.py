@@ -88,7 +88,47 @@ def _is_wp_plugin_cpe(target_sw: str) -> bool:
     return target_sw.lower() in ('wordpress', 'wordpress_plugin', '*')
 
 
-def _match_slug(cpe_product: str, known_slugs: list[str], threshold: float = 0.82) -> tuple[str | None, float]:
+_REF_SLUG_PATTERNS = [
+    re.compile(r'wordpress\.org/plugins/([a-z0-9][a-z0-9\-]{0,100})(?:/|$)'),
+    re.compile(r'wordpress\.org/themes/([a-z0-9][a-z0-9\-]{0,100})(?:/|$)'),
+    re.compile(r'plugins\.svn\.wordpress\.org/([a-z0-9][a-z0-9\-]{0,100})/'),
+    re.compile(r'plugins\.trac\.wordpress\.org/(?:browser|changeset/\d+)/([a-z0-9][a-z0-9\-]{0,100})'),
+]
+
+_PRERELEASE_RE = re.compile(r':(?:alpha|beta|rc)\d*:', re.IGNORECASE)
+
+
+def _extract_slug_from_refs(refs: list[str], plugin_slugs: list[str], theme_slugs: list[str]) -> tuple[str | None, str]:
+    """
+    Try to extract the WordPress slug directly from CVE reference URLs.
+    Returns (slug, software_type) or (None, '').
+    Only returns slugs that exist in the known wordlists.
+    """
+    known_plugins = set(plugin_slugs)
+    known_themes = set(theme_slugs)
+    for url in refs:
+        for pattern in _REF_SLUG_PATTERNS:
+            m = pattern.search(url)
+            if m:
+                slug = m.group(1)
+                if slug in known_plugins:
+                    return slug, "plugin"
+                if slug in known_themes:
+                    return slug, "theme"
+    return None, ""
+
+
+def _is_prerelease_cpe(cpe_uri: str) -> bool:
+    """Return True if the CPE URI refers to a pre-release version (alpha/beta/rc)."""
+    return bool(_PRERELEASE_RE.search(cpe_uri))
+
+
+def _canonical_slug(s: str) -> str:
+    """Convert CPE product name to canonical WordPress slug format (underscores → hyphens)."""
+    return re.sub(r'[_\s]+', '-', s.lower()).strip('-')
+
+
+def _match_slug(cpe_product: str, known_slugs: list[str], threshold: float = 0.90) -> tuple[str | None, float]:
     """
     Try to map cpe_product to a known slug.
     1. Normalized exact match
@@ -143,6 +183,10 @@ async def process_nvd_batch(
     matching the daily-patch JSON schema) is appended to it in addition to
     being persisted to the database.
     """
+    # Pre-compute sets for O(1) membership checks
+    plugin_slugs_set = set(plugin_slugs)
+    theme_slugs_set = set(theme_slugs)
+
     async with sf() as session:
         for item in vulns:
             cve = item.get("cve", {})
@@ -181,6 +225,10 @@ async def process_nvd_batch(
                         cpe_uri = cpe_match.get("criteria", "")
                         vendor, product, target_sw = _parse_cpe(cpe_uri)
                         if not product:
+                            continue
+
+                        # Descartar CPEs de versiones prerelease (alpha/beta/rc)
+                        if _is_prerelease_cpe(cpe_uri):
                             continue
 
                         v_start_i = cpe_match.get("versionStartIncluding")
@@ -238,16 +286,32 @@ async def process_nvd_batch(
                         if not _is_wp_plugin_cpe(target_sw):
                             continue
 
-                        # Try to map to a known plugin slug
-                        slug, conf = _match_slug(product, plugin_slugs)
-                        sw_type = "plugin"
-                        if not slug:
-                            slug, conf = _match_slug(product, theme_slugs)
-                            sw_type = "theme"
-                        if not slug:
-                            slug = product
-                            conf = 0.5
-                            sw_type = "plugin"
+                        # Multi-stage slug resolution pipeline
+                        slug: str | None = None
+                        conf: float = 0.0
+                        sw_type: str = "plugin"
+
+                        # ETAPA 0b: canonical slug exact match (underscore → hyphen)
+                        canonical = _canonical_slug(product)
+                        if canonical in plugin_slugs_set:
+                            slug, conf, sw_type = canonical, 1.0, "plugin"
+                        elif canonical in theme_slugs_set:
+                            slug, conf, sw_type = canonical, 1.0, "theme"
+                        else:
+                            # ETAPA 1: extraer slug de URLs de referencia del CVE
+                            slug, sw_type = _extract_slug_from_refs(refs_list, plugin_slugs, theme_slugs)
+                            if slug:
+                                conf = 0.95
+                            else:
+                                # ETAPA 2: Jaro-Winkler con threshold 0.90
+                                slug, conf = _match_slug(product, plugin_slugs, threshold=0.90)
+                                sw_type = "plugin"
+                                if not slug:
+                                    slug, conf = _match_slug(product, theme_slugs, threshold=0.90)
+                                    sw_type = "theme"
+                                if not slug:
+                                    # Sin match suficiente → NO insertar, skip silencioso
+                                    continue
 
                         vuln_obj = NormalizedVuln(
                             cve_id=cve_id,
