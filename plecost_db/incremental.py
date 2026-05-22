@@ -16,6 +16,17 @@ from plecost_db.updater import process_nvd_batch
 NVD_CVE_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 METADATA_KEY_LAST_SYNC = "last_nvd_sync"
 
+# Retry configuration for NVD API rate limiting and transient server errors
+_RETRY_429_WAITS = (30, 60, 120)   # seconds; HTTP 429 Too Many Requests
+_RETRY_5XX_WAITS = (10, 30)         # seconds; HTTP 5xx server errors
+
+
+class NVDHTTPError(Exception):
+    """Raised when the NVD API returns a non-recoverable non-200 response."""
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"NVD API returned HTTP {status_code}")
+        self.status_code = status_code
+
 
 class IncrementalUpdater:
     """
@@ -58,13 +69,18 @@ class IncrementalUpdater:
 
         total = 0
         async with httpx.AsyncClient(timeout=60, headers=headers) as client:
-            total = await self._fetch_modified(
-                client, sf, last_sync, now_str, plugin_slugs, theme_slugs,
-                patch_records,
-            )
+            try:
+                # AC-13: _fetch_modified checkpoints last_nvd_sync after EACH
+                # successfully completed 90-day window, so a mid-run failure
+                # only re-processes the current (incomplete) window on the
+                # next run — not the entire range from the beginning.
+                total = await self._fetch_modified(
+                    client, sf, last_sync, now_str, plugin_slugs, theme_slugs,
+                    patch_records,
+                )
+            except NVDHTTPError:
+                pass  # partial progress already checkpointed per-window above
 
-        # Update last_sync
-        await self._set_last_sync(sf, now_str)
         await engine.dispose()
 
         # Write daily patch JSON if requested
@@ -108,6 +124,38 @@ class IncrementalUpdater:
             themes = (await session.execute(select(ThemesWordlist.slug))).scalars().all()
         return list(plugins), list(themes)
 
+    async def _nvd_request(
+        self,
+        client: httpx.AsyncClient,
+        params: dict[str, str | int],
+    ) -> dict[str, Any]:
+        """
+        Perform a single NVD API GET with retry logic for rate-limit and server errors.
+
+        - HTTP 429: retry up to 3 times with exponential backoff (30 s, 60 s, 120 s)
+        - HTTP 5xx: retry up to 2 times with shorter backoff (10 s, 30 s)
+        - Other non-200: raise NVDHTTPError immediately (caller handles)
+        """
+        retry_429 = 0
+        retry_5xx = 0
+        while True:
+            r = await client.get(NVD_CVE_API, params=params, timeout=60)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                if retry_429 < len(_RETRY_429_WAITS):
+                    await asyncio.sleep(_RETRY_429_WAITS[retry_429])
+                    retry_429 += 1
+                    continue
+                raise NVDHTTPError(429)
+            if r.status_code >= 500:
+                if retry_5xx < len(_RETRY_5XX_WAITS):
+                    await asyncio.sleep(_RETRY_5XX_WAITS[retry_5xx])
+                    retry_5xx += 1
+                    continue
+                raise NVDHTTPError(r.status_code)
+            raise NVDHTTPError(r.status_code)
+
     async def _fetch_modified(
         self,
         client: httpx.AsyncClient,
@@ -131,6 +179,7 @@ class IncrementalUpdater:
             window_end = min(window_start + timedelta(days=NVD_WINDOW_DAYS), overall_end)
             mod_start = window_start.strftime("%Y-%m-%dT%H:%M:%S.000")
             mod_end = window_end.strftime("%Y-%m-%dT%H:%M:%S.999")
+            window_end_str = window_end.strftime("%Y-%m-%dT%H:%M:%S.999")
             start_index = 0
 
             while True:
@@ -142,12 +191,10 @@ class IncrementalUpdater:
                     "startIndex": start_index,
                 }
                 try:
-                    r = await client.get(NVD_CVE_API, params=params, timeout=60)
-                    if r.status_code != 200:
-                        break
-                    data = r.json()
-                except Exception:
-                    break
+                    data = await self._nvd_request(client, params)
+                except (NVDHTTPError, Exception):
+                    # Window failed — do not checkpoint; let caller decide
+                    raise
 
                 vulns = data.get("vulnerabilities", [])
                 if not vulns:
@@ -162,7 +209,14 @@ class IncrementalUpdater:
                     break
                 await asyncio.sleep(delay)
 
-            window_start = window_end + timedelta(days=1)
+            # Window completed successfully — checkpoint last_nvd_sync so a
+            # future failure re-processes only the current (not yet started)
+            # window, not the full range from the original last_sync.
+            await self._set_last_sync(sf, window_end_str)
+
+            # Advance by 1 second (not 1 day) to avoid losing CVEs modified in the
+            # last 24 h of the previous window on the next iteration.
+            window_start = window_end + timedelta(seconds=1)
             await asyncio.sleep(delay)
 
         return total_processed

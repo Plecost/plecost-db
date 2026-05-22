@@ -406,7 +406,8 @@ class DatabaseUpdater:
     async def _fetch_plugin_slugs(
         self, client: httpx.AsyncClient, sf: async_sessionmaker[AsyncSession]
     ) -> list[str]:
-        slugs: list[str] = []
+        # Maps slug → active_installs for the DB upsert below
+        slug_installs: dict[str, int] = {}
         for page in range(1, 20):  # up to 5000 plugins
             try:
                 r = await client.get(WP_PLUGINS_API.format(page=page), timeout=30)
@@ -414,25 +415,38 @@ class DatabaseUpdater:
                 plugins = data.get("plugins", {})
                 if not plugins:
                     break
-                page_slugs = list(plugins.keys()) if isinstance(plugins, dict) else [p.get("slug", "") for p in plugins]
-                slugs.extend(s for s in page_slugs if s)
-                if len(page_slugs) < 250:
+                if isinstance(plugins, dict):
+                    # Keyed by slug; each value is a plugin info dict
+                    for slug, info in plugins.items():
+                        if slug:
+                            installs = int(info.get("active_installs", 0)) if isinstance(info, dict) else 0
+                            slug_installs[slug] = installs
+                    page_count = len(plugins)
+                else:
+                    for p in plugins:
+                        slug = p.get("slug", "") if isinstance(p, dict) else ""
+                        if slug:
+                            slug_installs[slug] = int(p.get("active_installs", 0))
+                    page_count = len(plugins)
+                if page_count < 250:
                     break
             except Exception:
                 break
         # Save to DB
         async with sf() as session:
-            for slug in slugs:
+            for slug, active_installs in slug_installs.items():
                 existing = await session.get(PluginsWordlist, slug)
                 if not existing:
-                    session.add(PluginsWordlist(slug=slug))
+                    session.add(PluginsWordlist(slug=slug, active_installs=active_installs))
+                else:
+                    existing.active_installs = active_installs
             await session.commit()
-        return slugs
+        return list(slug_installs.keys())
 
     async def _fetch_theme_slugs(
         self, client: httpx.AsyncClient, sf: async_sessionmaker[AsyncSession]
     ) -> list[str]:
-        slugs: list[str] = []
+        slug_installs: dict[str, int] = {}
         for page in range(1, 10):
             try:
                 r = await client.get(WP_THEMES_API.format(page=page), timeout=30)
@@ -440,19 +454,24 @@ class DatabaseUpdater:
                 themes = data.get("themes", [])
                 if not themes:
                     break
-                page_slugs = [t.get("slug", "") for t in themes if isinstance(t, dict)]
-                slugs.extend(s for s in page_slugs if s)
+                for t in themes:
+                    if isinstance(t, dict):
+                        slug = t.get("slug", "")
+                        if slug:
+                            slug_installs[slug] = int(t.get("active_installs", 0))
                 if len(themes) < 100:
                     break
             except Exception:
                 break
         async with sf() as session:
-            for slug in slugs:
+            for slug, active_installs in slug_installs.items():
                 existing = await session.get(ThemesWordlist, slug)
                 if not existing:
-                    session.add(ThemesWordlist(slug=slug))
+                    session.add(ThemesWordlist(slug=slug, active_installs=active_installs))
+                else:
+                    existing.active_installs = active_installs
             await session.commit()
-        return slugs
+        return list(slug_installs.keys())
 
     async def _fetch_nvd(
         self, client: httpx.AsyncClient, sf: async_sessionmaker[AsyncSession], plugin_slugs: list[str], theme_slugs: list[str],
@@ -505,5 +524,7 @@ class DatabaseUpdater:
                     break
                 await asyncio.sleep(delay)
 
-            window_start = window_end + timedelta(days=1)
+            # AC-12: advance by 1 second (not 1 day) to avoid losing CVEs modified
+            # in the final second of the previous window on the next iteration.
+            window_start = window_end + timedelta(seconds=1)
             await asyncio.sleep(delay)
