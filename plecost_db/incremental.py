@@ -200,7 +200,7 @@ class IncrementalUpdater:
                 if not vulns:
                     break
 
-                await process_nvd_batch(vulns, sf, plugin_slugs, theme_slugs, collected)
+                await process_nvd_batch(vulns, sf, plugin_slugs, theme_slugs, collected, http_client=client)
                 total_processed += len(vulns)
 
                 total = data.get("totalResults", 0)

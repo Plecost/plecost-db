@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## [4.8.0] - 2026-05-24
+
+### Fixed
+- `updater.py` (G-005 / `_upsert_vuln_free`): added `title`, `remediation`, and `has_exploit` to the attribute-update loop so that a higher-confidence re-match fully replaces the existing DB row instead of leaving stale values from the original insert.
+- `updater.py` (G2-018 / `process_nvd_batch`): deduplicate `collected` records by `(cve_id, slug)` key, keeping only the entry with the highest `match_confidence`; same-or-lower confidence duplicates are silently discarded, preventing double-counting in patch files.
+- `updater.py` (G2-019 / `process_nvd_batch`): fetch the CISA KEV catalog once per batch call when `collected` is not `None`; set `has_exploit=True` on matching CVE IDs in patch records. On network/JSON failure, log a WARNING and fall back to `False` for the whole batch. An optional `http_client` parameter was added; a temporary client is created internally when not supplied. DB `NormalizedVuln` objects always receive `has_exploit=False` (KEV flag is patch-records only).
+- `incremental.py` (G2-019 follow-up): pass `http_client=client` to `process_nvd_batch` inside `_fetch_modified` so the KEV fetch reuses the existing session instead of opening a new connection.
+- `incremental.py` (G2-020 / `_fetch_modified`): apply `.replace(tzinfo=timezone.utc)` after `datetime.fromisoformat()` on both `window_start` and `overall_end` to prevent `TypeError` when comparing naive vs. aware datetimes.
+
+### Added
+- `tests/unit/test_updater_fixes.py`: 8 new unit tests covering all 4 fixes (G-005, G2-018, G2-019, G2-020), including KEV fetch failure fallback and timezone-aware datetime comparison.
+
 ## [1.2.0] - 2026-05-22
 
 ### Fixed
