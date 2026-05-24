@@ -172,8 +172,8 @@ class IncrementalUpdater:
         delay = 6 if not self._api_key else 0.6
         total_processed = 0
 
-        window_start = datetime.fromisoformat(last_sync.rstrip("Z"))
-        overall_end = datetime.fromisoformat(end_date.rstrip("Z"))
+        window_start = datetime.fromisoformat(last_sync.rstrip("Z")).replace(tzinfo=timezone.utc)  # G2-020
+        overall_end = datetime.fromisoformat(end_date.rstrip("Z")).replace(tzinfo=timezone.utc)  # G2-020
 
         while window_start < overall_end:
             window_end = min(window_start + timedelta(days=NVD_WINDOW_DAYS), overall_end)

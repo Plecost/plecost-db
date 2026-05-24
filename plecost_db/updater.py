@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -11,7 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from plecost.database.engine import make_engine, make_session_factory
 from plecost.database.models import Base, DbMetadata, NormalizedVuln, PluginsWordlist, ThemesWordlist
 
+logger = logging.getLogger(__name__)
+
 NVD_CVE_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 WP_PLUGINS_API = "https://api.wordpress.org/plugins/info/1.2/?action=query_plugins&request[per_page]=250&request[page]={page}"
 WP_THEMES_API = "https://api.wordpress.org/themes/info/1.2/?action=query_themes&request[per_page]=100&request[page]={page}"
 
@@ -166,26 +170,55 @@ async def _upsert_vuln_free(session: AsyncSession, vuln: NormalizedVuln) -> None
             for attr in ["cpe_vendor", "cpe_product", "match_confidence",
                          "version_start_incl", "version_start_excl",
                          "version_end_incl", "version_end_excl",
-                         "cvss_score", "severity", "description", "references_json"]:
+                         "cvss_score", "severity", "description", "references_json",
+                         "title", "remediation", "has_exploit"]:  # G-005
                 setattr(existing, attr, getattr(vuln, attr))
     else:
         session.add(vuln)
+
+
+async def _fetch_kev_ids(client: httpx.AsyncClient) -> frozenset[str]:
+    """Fetch CISA KEV CVE IDs. Returns empty frozenset on failure."""
+    try:
+        r = await client.get(CISA_KEV_URL, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return frozenset(v["cveID"] for v in data.get("vulnerabilities", []))
+    except Exception as e:
+        logger.warning("CISA KEV fetch failed: %s — has_exploit will be False for this batch", e)
+        return frozenset()
 
 
 async def process_nvd_batch(
     vulns: list[Any], sf: async_sessionmaker[AsyncSession],
     plugin_slugs: list[str], theme_slugs: list[str],
     collected: list[dict[str, Any]] | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> None:
     """Free reusable function called from both updater and incremental.
 
     If *collected* is provided, each processed vulnerability record (as a dict
     matching the daily-patch JSON schema) is appended to it in addition to
     being persisted to the database.
+
+    *http_client* is an optional httpx.AsyncClient used for the CISA KEV lookup
+    when *collected* is not None. If not provided, a temporary client is created.
     """
     # Pre-compute sets for O(1) membership checks
     plugin_slugs_set = set(plugin_slugs)
     theme_slugs_set = set(theme_slugs)
+
+    # G2-019: Fetch CISA KEV once per batch (only when writing patch records)
+    kev_ids: frozenset[str] = frozenset()
+    if collected is not None:
+        if http_client is not None:
+            kev_ids = await _fetch_kev_ids(http_client)
+        else:
+            async with httpx.AsyncClient() as _tmp_client:
+                kev_ids = await _fetch_kev_ids(_tmp_client)
+
+    # G2-018: Deduplication tracker — (cve_id, slug) → index in collected
+    _collected_seen: dict[tuple[str, str], int] = {}
 
     async with sf() as session:
         for item in vulns:
@@ -255,11 +288,13 @@ async def process_nvd_batch(
                                 description=desc,
                                 remediation="Update WordPress to the latest version.",
                                 references_json=refs,
+                                has_exploit=False,  # KEV flag goes in patch records only (spec non-goal)
                                 published_at=published,
                             )
                             await _upsert_vuln_free(session, vuln_obj)
                             if collected is not None:
-                                collected.append({
+                                _key = (cve_id, "wordpress")
+                                _record = {
                                     "cve_id": cve_id,
                                     "software_type": "core",
                                     "slug": "wordpress",
@@ -276,9 +311,14 @@ async def process_nvd_batch(
                                     "description": desc,
                                     "remediation": "Update WordPress to the latest version.",
                                     "references": refs_list,
-                                    "has_exploit": False,
+                                    "has_exploit": cve_id in kev_ids,  # G2-019
                                     "published_at": published_date,
-                                })
+                                }
+                                if _key not in _collected_seen:  # G2-018
+                                    _collected_seen[_key] = len(collected)
+                                    collected.append(_record)
+                                elif _record["match_confidence"] > collected[_collected_seen[_key]]["match_confidence"]:  # G2-018: higher confidence replaces
+                                    collected[_collected_seen[_key]] = _record
                             found_any = True
                             continue
 
@@ -330,11 +370,13 @@ async def process_nvd_batch(
                             description=desc,
                             remediation="Update the plugin/theme to the latest version.",
                             references_json=refs,
+                            has_exploit=False,  # KEV flag goes in patch records only (spec non-goal)
                             published_at=published,
                         )
                         await _upsert_vuln_free(session, vuln_obj)
                         if collected is not None:
-                            collected.append({
+                            _key = (cve_id, slug)
+                            _record = {
                                 "cve_id": cve_id,
                                 "software_type": sw_type,
                                 "slug": slug,
@@ -351,9 +393,14 @@ async def process_nvd_batch(
                                 "description": desc,
                                 "remediation": "Update the plugin/theme to the latest version.",
                                 "references": refs_list,
-                                "has_exploit": False,
+                                "has_exploit": cve_id in kev_ids,  # G2-019
                                 "published_at": published_date,
-                            })
+                            }
+                            if _key not in _collected_seen:  # G2-018
+                                _collected_seen[_key] = len(collected)
+                                collected.append(_record)
+                            elif _record["match_confidence"] > collected[_collected_seen[_key]]["match_confidence"]:  # G2-018: higher confidence replaces
+                                collected[_collected_seen[_key]] = _record
                         found_any = True
 
             # If there were no useful configurations, skip
